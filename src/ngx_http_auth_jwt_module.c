@@ -56,12 +56,13 @@ static char *merge_extract_response_claims(ngx_conf_t *cf, ngx_command_t *cmd, v
 static auth_jwt_ctx_t *get_or_init_jwt_module_ctx(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf);
 static auth_jwt_ctx_t *get_request_jwt_ctx(ngx_http_request_t *r);
 static ngx_int_t handle_request(ngx_http_request_t *r);
-static int validate_alg(auth_jwt_conf_t *jwtcf, jwt_t *jwt);
-static int validate_exp(auth_jwt_conf_t *jwtcf, jwt_t *jwt);
-static int validate_sub(auth_jwt_conf_t *jwtcf, jwt_t *jwt);
-static ngx_int_t extract_var_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, jwt_t *jwt, auth_jwt_ctx_t *ctx);
-static void extract_request_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, jwt_t *jwt);
-static void extract_response_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, jwt_t *jwt);
+static int capture_claims(jwt_t *jwt, jwt_config_t *config);
+static const char *get_claim_str(json_t *claims, const char *name);
+static int validate_exp(auth_jwt_conf_t *jwtcf, json_t *claims);
+static int validate_sub(auth_jwt_conf_t *jwtcf, json_t *claims);
+static ngx_int_t extract_var_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, json_t *claims, auth_jwt_ctx_t *ctx);
+static void extract_request_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, json_t *claims);
+static void extract_response_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, json_t *claims);
 static ngx_int_t redirect(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf);
 static ngx_int_t load_public_key(ngx_conf_t *cf, auth_jwt_conf_t *conf);
 static char *get_jwt(ngx_http_request_t *r, ngx_str_t jwt_location);
@@ -492,10 +493,11 @@ static auth_jwt_ctx_t *get_request_jwt_ctx(ngx_http_request_t *r)
     ngx_str_t algorithm = jwtcf->algorithm;
     int keyLength;
     u_char *key;
-    jwt_t *jwt = NULL;
+    unsigned int keyFlags = JWK_KEY_NONE;
 
     if (algorithm.len == 0 || (algorithm.len == 5 && ngx_strncmp(algorithm.data, "HS", 2) == 0))
     {
+      keyFlags = JWK_KEY_TRY_HMAC;
       keyLength = jwtcf->key.len / 2;
       key = ngx_palloc(r->pool, keyLength);
 
@@ -526,34 +528,59 @@ static auth_jwt_ctx_t *get_request_jwt_ctx(ngx_http_request_t *r)
       return ctx;
     }
 
-    if (jwt_decode(&jwt, jwtPtr, key, keyLength) != 0 || !jwt)
+    // the checker pins the token's alg to the configured one, so a token can't pick its own
+    jwt_alg_t alg = algorithm.len == 0 ? JWT_ALG_HS256 : jwt_str_alg((const char *)algorithm.data);
+    jwk_set_t *jwks = jwks_create_fromkey((const char *)key, keyLength, keyFlags);
+    jwt_checker_t *checker = jwt_checker_new();
+    char *claimsJson = NULL;
+    json_t *claims = NULL;
+
+    if (jwks == NULL || jwks_error(jwks) || jwks_item_get(jwks, 0) == NULL)
     {
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to parse JWT");
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to load JWT key");
       ctx->validation_status = NGX_ERROR;
     }
-    else if (validate_alg(jwtcf, jwt) != 0)
+    else if (checker == NULL)
     {
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "invalid algorithm specified");
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to allocate JWT checker");
       ctx->validation_status = NGX_ERROR;
     }
-    else if (validate_exp(jwtcf, jwt) != 0)
+    else if (jwt_checker_setkey(checker, alg, jwks_item_get(jwks, 0)) != 0 || jwt_checker_setcb(checker, capture_claims, &claimsJson) != 0)
+    {
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to set up JWT checker: %s", jwt_checker_error_msg(checker));
+      ctx->validation_status = NGX_ERROR;
+    }
+    else if (jwt_checker_verify(checker, jwtPtr) != 0)
+    {
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to verify JWT: %s", jwt_checker_error_msg(checker));
+      ctx->validation_status = NGX_ERROR;
+    }
+    else if ((claims = json_loads(claimsJson, 0, NULL)) == NULL)
+    {
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to parse JWT claims");
+      ctx->validation_status = NGX_ERROR;
+    }
+    else if (validate_exp(jwtcf, claims) != 0)
     {
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "the JWT has expired");
       ctx->validation_status = NGX_ERROR;
     }
-    else if (validate_sub(jwtcf, jwt) != 0)
+    else if (validate_sub(jwtcf, claims) != 0)
     {
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "the JWT does not contain a subject");
       ctx->validation_status = NGX_ERROR;
     }
     else
     {
-      extract_request_claims(r, jwtcf, jwt);
-      extract_response_claims(r, jwtcf, jwt);
-      ctx->validation_status = extract_var_claims(r, jwtcf, jwt, ctx);
+      extract_request_claims(r, jwtcf, claims);
+      extract_response_claims(r, jwtcf, claims);
+      ctx->validation_status = extract_var_claims(r, jwtcf, claims, ctx);
     }
 
-    jwt_free(jwt);
+    json_decref(claims);
+    free(claimsJson);
+    jwt_checker_free(checker);
+    jwks_free(jwks);
     return ctx;
   }
 }
@@ -585,21 +612,31 @@ static ngx_int_t handle_request(ngx_http_request_t *r)
   }
 }
 
-static int validate_alg(auth_jwt_conf_t *jwtcf, jwt_t *jwt)
+// libjwt v3 runs this before the signature is verified, so it only copies the claims out
+static int capture_claims(jwt_t *jwt, jwt_config_t *config)
 {
-  const jwt_alg_t alg = jwt_get_alg(jwt);
+  jwt_value_t claims;
 
-  if (alg != JWT_ALG_HS256 && alg != JWT_ALG_HS384 && alg != JWT_ALG_HS512 && alg != JWT_ALG_RS256 && alg != JWT_ALG_RS384 && alg != JWT_ALG_RS512 && alg != JWT_ALG_ES256 && alg != JWT_ALG_ES384 && alg != JWT_ALG_ES512)
+  jwt_set_GET_JSON(&claims, NULL);
+
+  if (jwt_claim_get(jwt, &claims) != JWT_VALUE_ERR_NONE)
   {
     return 1;
   }
 
+  *(char **)config->ctx = claims.json_val;
+
   return 0;
 }
 
-static int validate_exp(auth_jwt_conf_t *jwtcf, jwt_t *jwt)
+static const char *get_claim_str(json_t *claims, const char *name)
 {
-  const time_t exp = (time_t)jwt_get_grant_int(jwt, "exp");
+  return json_string_value(json_object_get(claims, name));
+}
+
+static int validate_exp(auth_jwt_conf_t *jwtcf, json_t *claims)
+{
+  const time_t exp = (time_t)json_integer_value(json_object_get(claims, "exp"));
   const time_t now = time(NULL);
 
   if (exp < now)
@@ -610,11 +647,11 @@ static int validate_exp(auth_jwt_conf_t *jwtcf, jwt_t *jwt)
   return 0;
 }
 
-static int validate_sub(auth_jwt_conf_t *jwtcf, jwt_t *jwt)
+static int validate_sub(auth_jwt_conf_t *jwtcf, json_t *claims)
 {
   if (jwtcf->validate_sub == 1)
   {
-    const char *sub = jwt_get_grant(jwt, "sub");
+    const char *sub = get_claim_str(claims, "sub");
 
     if (sub == NULL)
     {
@@ -625,22 +662,22 @@ static int validate_sub(auth_jwt_conf_t *jwtcf, jwt_t *jwt)
   return 0;
 }
 
-static ngx_int_t extract_var_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, jwt_t *jwt, auth_jwt_ctx_t *ctx)
+static ngx_int_t extract_var_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, json_t *claims, auth_jwt_ctx_t *ctx)
 {
-  ngx_array_t *claims = jwtcf->extract_var_claims;
+  ngx_array_t *varClaims = jwtcf->extract_var_claims;
 
-  if (claims == NULL || claims->nelts == 0)
+  if (varClaims == NULL || varClaims->nelts == 0)
   {
     return NGX_OK;
   }
   else
   {
-    const ngx_str_t *claimsPtr = claims->elts;
+    const ngx_str_t *claimsPtr = varClaims->elts;
 
-    for (uint i = 0; i < claims->nelts; ++i)
+    for (uint i = 0; i < varClaims->nelts; ++i)
     {
       const ngx_str_t claim = claimsPtr[i];
-      const char *claimValue = jwt_get_grant(jwt, (char *)claim.data);
+      const char *claimValue = get_claim_str(claims, (char *)claim.data);
       ngx_str_t value = ngx_string("");
 
       if (claimValue != NULL && strlen(claimValue) > 0)
@@ -656,7 +693,7 @@ static ngx_int_t extract_var_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtc
   }
 }
 
-static void extract_claims(ngx_http_request_t *r, jwt_t *jwt, ngx_array_t *claims, ngx_int_t (*set_header)(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *value))
+static void extract_claims(ngx_http_request_t *r, json_t *jwtClaims, ngx_array_t *claims, ngx_int_t (*set_header)(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *value))
 {
   if (claims != NULL && claims->nelts > 0)
   {
@@ -665,7 +702,7 @@ static void extract_claims(ngx_http_request_t *r, jwt_t *jwt, ngx_array_t *claim
     for (uint i = 0; i < claims->nelts; ++i)
     {
       const ngx_str_t claim = claimsPtr[i];
-      const char *value = jwt_get_grant(jwt, (char *)claim.data);
+      const char *value = get_claim_str(jwtClaims, (char *)claim.data);
 
       if (value != NULL && strlen(value) > 0)
       {
@@ -683,14 +720,14 @@ static void extract_claims(ngx_http_request_t *r, jwt_t *jwt, ngx_array_t *claim
   }
 }
 
-static void extract_request_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, jwt_t *jwt)
+static void extract_request_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, json_t *claims)
 {
-  extract_claims(r, jwt, jwtcf->extract_request_claims, set_request_header);
+  extract_claims(r, claims, jwtcf->extract_request_claims, set_request_header);
 }
 
-static void extract_response_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, jwt_t *jwt)
+static void extract_response_claims(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf, json_t *claims)
 {
-  extract_claims(r, jwt, jwtcf->extract_response_claims, set_response_header);
+  extract_claims(r, claims, jwtcf->extract_response_claims, set_response_header);
 }
 
 static ngx_int_t redirect(ngx_http_request_t *r, auth_jwt_conf_t *jwtcf)
